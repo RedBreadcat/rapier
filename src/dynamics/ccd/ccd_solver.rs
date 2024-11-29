@@ -4,7 +4,9 @@ use crate::geometry::{ColliderParent, ColliderSet, CollisionEvent, NarrowPhase};
 use crate::math::Real;
 use crate::parry::utils::SortedPair;
 use crate::pipeline::{EventHandler, QueryPipeline};
-use crate::prelude::{query_pipeline_generators, ActiveEvents, CollisionEventFlags};
+use crate::prelude::{
+    query_pipeline_generators, ActiveEvents, CollisionEventFlags, RigidBody, RigidBodyVelocity,
+};
 use parry::query::{DefaultQueryDispatcher, QueryDispatcher};
 use parry::utils::hashmap::HashMap;
 use std::collections::BinaryHeap;
@@ -252,92 +254,32 @@ impl CCDSolver {
         // TODO: don't iterate through all the colliders.
         for handle in islands.active_dynamic_bodies() {
             let rb1 = &bodies[*handle];
+            self.gather_toi_rb(
+                dt,
+                bodies,
+                colliders,
+                narrow_phase,
+                rb1,
+                &rb1.integrated_vels,
+                &mut all_toi,
+                &mut pairs_seen,
+                &mut min_overstep,
+            );
+        }
 
-            if rb1.ccd.ccd_active {
-                let predicted_body_pos1 = rb1.pos.integrate_forces_and_velocities(
-                    dt,
-                    &rb1.forces,
-                    &rb1.integrated_vels,
-                    &rb1.mprops,
-                );
-
-                for ch1 in &rb1.colliders.0 {
-                    let co1 = &colliders[*ch1];
-                    let co_parent1 = co1
-                        .parent
-                        .as_ref()
-                        .expect("Could not find the ColliderParent component.");
-
-                    let predicted_collider_pos1 = predicted_body_pos1 * co_parent1.pos_wrt_parent;
-                    let aabb1 = co1
-                        .shape
-                        .compute_swept_aabb(&co1.pos, &predicted_collider_pos1);
-
-                    self.query_pipeline
-                        .colliders_with_aabb_intersecting_aabb(&aabb1, |ch2| {
-                            if *ch1 == *ch2 {
-                                // Ignore self-intersection.
-                                return true;
-                            }
-
-                            if pairs_seen
-                                .insert(
-                                    SortedPair::new(ch1.into_raw_parts().0, ch2.into_raw_parts().0),
-                                    (),
-                                )
-                                .is_none()
-                            {
-                                let co1 = &colliders[*ch1];
-                                let co2 = &colliders[*ch2];
-
-                                let bh1 = co1.parent.map(|p| p.handle);
-                                let bh2 = co2.parent.map(|p| p.handle);
-
-                                // Ignore self-intersections and apply groups filter.
-                                if bh1 == bh2
-                                    || !co1.flags.collision_groups.test(co2.flags.collision_groups)
-                                {
-                                    return true;
-                                }
-
-                                let smallest_dist = narrow_phase
-                                    .contact_pair(*ch1, *ch2)
-                                    .and_then(|p| p.find_deepest_contact())
-                                    .map(|c| c.1.dist)
-                                    .unwrap_or(0.0);
-
-                                let rb1 = bh1.map(|h| &bodies[h]);
-                                let rb2 = bh2.map(|h| &bodies[h]);
-
-                                if let Some(toi) = TOIEntry::try_from_colliders(
-                                    self.query_pipeline.query_dispatcher(),
-                                    *ch1,
-                                    *ch2,
-                                    co1,
-                                    co2,
-                                    rb1,
-                                    rb2,
-                                    None,
-                                    None,
-                                    0.0,
-                                    // NOTE: we use dt here only once we know that
-                                    // there is at least one TOI before dt.
-                                    min_overstep,
-                                    smallest_dist,
-                                ) {
-                                    if toi.toi > dt {
-                                        min_overstep = min_overstep.min(toi.toi);
-                                    } else {
-                                        min_overstep = dt;
-                                        all_toi.push(toi);
-                                    }
-                                }
-                            }
-
-                            true
-                        });
-                }
-            }
+        for handle in islands.active_kinematic_bodies() {
+            let rb1 = &bodies[*handle];
+            self.gather_toi_rb(
+                dt,
+                bodies,
+                colliders,
+                narrow_phase,
+                rb1,
+                &rb1.vels,
+                &mut all_toi,
+                &mut pairs_seen,
+                &mut min_overstep,
+            );
         }
 
         /*
@@ -552,5 +494,101 @@ impl CCDSolver {
         }
 
         PredictedImpacts::Impacts(frozen)
+    }
+
+    fn gather_toi_rb(
+        &self,
+        dt: Real,
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+        narrow_phase: &NarrowPhase,
+        rb1: &RigidBody,
+        vels: &RigidBodyVelocity,
+        all_toi: &mut BinaryHeap<TOIEntry>,
+        pairs_seen: &mut HashMap<SortedPair<u32>, ()>,
+        min_overstep: &mut Real,
+    ) {
+        if rb1.ccd.ccd_active {
+            let predicted_body_pos1 =
+                rb1.pos
+                    .integrate_forces_and_velocities(dt, &rb1.forces, &vels, &rb1.mprops);
+
+            for ch1 in &rb1.colliders.0 {
+                let co1 = &colliders[*ch1];
+                let co_parent1 = co1
+                    .parent
+                    .as_ref()
+                    .expect("Could not find the ColliderParent component.");
+
+                let predicted_collider_pos1 = predicted_body_pos1 * co_parent1.pos_wrt_parent;
+                let aabb1 = co1
+                    .shape
+                    .compute_swept_aabb(&co1.pos, &predicted_collider_pos1);
+
+                self.query_pipeline
+                    .colliders_with_aabb_intersecting_aabb(&aabb1, |ch2| {
+                        if *ch1 == *ch2 {
+                            // Ignore self-intersection.
+                            return true;
+                        }
+
+                        if pairs_seen
+                            .insert(
+                                SortedPair::new(ch1.into_raw_parts().0, ch2.into_raw_parts().0),
+                                (),
+                            )
+                            .is_none()
+                        {
+                            let co1 = &colliders[*ch1];
+                            let co2 = &colliders[*ch2];
+
+                            let bh1 = co1.parent.map(|p| p.handle);
+                            let bh2 = co2.parent.map(|p| p.handle);
+
+                            // Ignore self-intersections and apply groups filter.
+                            if bh1 == bh2
+                                || !co1.flags.collision_groups.test(co2.flags.collision_groups)
+                            {
+                                return true;
+                            }
+
+                            let smallest_dist = narrow_phase
+                                .contact_pair(*ch1, *ch2)
+                                .and_then(|p| p.find_deepest_contact())
+                                .map(|c| c.1.dist)
+                                .unwrap_or(0.0);
+
+                            let rb1 = bh1.map(|h| &bodies[h]);
+                            let rb2 = bh2.map(|h| &bodies[h]);
+
+                            if let Some(toi) = TOIEntry::try_from_colliders(
+                                self.query_pipeline.query_dispatcher(),
+                                *ch1,
+                                *ch2,
+                                co1,
+                                co2,
+                                rb1,
+                                rb2,
+                                None,
+                                None,
+                                0.0,
+                                // NOTE: we use dt here only once we know that
+                                // there is at least one TOI before dt.
+                                *min_overstep,
+                                smallest_dist,
+                            ) {
+                                if toi.toi > dt {
+                                    *min_overstep = min_overstep.min(toi.toi);
+                                } else {
+                                    *min_overstep = dt;
+                                    all_toi.push(toi);
+                                }
+                            }
+                        }
+
+                        true
+                    });
+            }
+        }
     }
 }
