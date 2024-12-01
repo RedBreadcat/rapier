@@ -89,24 +89,25 @@ pub fn init_world(testbed: &mut Testbed) {
      * The first one has CCD enabled and a sensor collider attached to it.
      * The second one has CCD enabled and a collider attached to it.
      */
-    let collider = ColliderBuilder::ball(1.0)
-        .density(10.0)
-        .sensor(true)
-        .active_events(ActiveEvents::COLLISION_EVENTS);
-    let rigid_body = RigidBodyBuilder::dynamic()
-        .linvel(vector![1000.0, 0.0, 0.0])
-        .translation(vector![-20.0, shift_y + 2.0, 0.0])
-        .ccd_enabled(true);
-    let sensor_handle = bodies.insert(rigid_body);
-    colliders.insert_with_parent(collider, sensor_handle, &mut bodies);
+    // let collider = ColliderBuilder::ball(1.0)
+    //     .density(10.0)
+    //     .sensor(true)
+    //     .active_events(ActiveEvents::COLLISION_EVENTS);
+    // let rigid_body = RigidBodyBuilder::dynamic()
+    //     .linvel(vector![1000.0, 0.0, 0.0])
+    //     .translation(vector![-20.0, shift_y + 2.0, 0.0])
+    //     .ccd_enabled(true);
+    // let sensor_handle = bodies.insert(rigid_body);
+    // colliders.insert_with_parent(collider, sensor_handle, &mut bodies);
 
     // Second rigid-body with CCD enabled.
     let collider = ColliderBuilder::ball(1.0).density(10.0);
-    let rigid_body = RigidBodyBuilder::dynamic()
+    let rigid_body = RigidBodyBuilder::kinematic_velocity_based()
         .linvel(vector![1000.0, 0.0, 0.0])
         .translation(vector![-20.0, shift_y + 2.0, shift_z])
         .ccd_enabled(true);
     let handle = bodies.insert(rigid_body);
+    println!("Projectile handle {:?}", handle);
     colliders.insert_with_parent(collider.clone(), handle, &mut bodies);
     testbed.set_initial_body_color(handle, [0.2, 0.2, 1.0]);
 
@@ -132,14 +133,14 @@ pub fn init_world(testbed: &mut Testbed) {
                 .parent()
                 .unwrap();
 
-            if let Some(graphics) = &mut graphics {
-                if parent_handle1 != ground_handle && parent_handle1 != sensor_handle {
-                    graphics.set_body_color(parent_handle1, color);
-                }
-                if parent_handle2 != ground_handle && parent_handle2 != sensor_handle {
-                    graphics.set_body_color(parent_handle2, color);
-                }
-            }
+            //if let Some(graphics) = &mut graphics {
+            //    if parent_handle1 != ground_handle && parent_handle1 != sensor_handle {
+            //        graphics.set_body_color(parent_handle1, color);
+            //    }
+            //    if parent_handle2 != ground_handle && parent_handle2 != sensor_handle {
+            //        graphics.set_body_color(parent_handle2, color);
+            //    }
+            //}
         }
     });
 

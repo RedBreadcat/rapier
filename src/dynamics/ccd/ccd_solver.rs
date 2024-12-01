@@ -59,20 +59,18 @@ impl CCDSolver {
                 let rb = bodies.index_mut_internal(*handle);
                 let local_com = &rb.mprops.local_mprops.local_com;
 
+                let vels = if rb.is_dynamic() {
+                    &rb.integrated_vels
+                } else {
+                    &rb.vels
+                };
+
                 let min_toi = (rb.ccd.ccd_thickness
                     * 0.15
-                    * crate::utils::inv(rb.ccd.max_point_velocity(&rb.integrated_vels)))
+                    * crate::utils::inv(rb.ccd.max_point_velocity(vels)))
                 .min(dt);
-                // println!(
-                //     "Min toi: {}, Toi: {}, thick: {}, max_vel: {}",
-                //     min_toi,
-                //     toi,
-                //     rb.ccd.ccd_thickness,
-                //     rb.ccd.max_point_velocity(&rb.integrated_vels)
-                // );
-                let new_pos =
-                    rb.integrated_vels
-                        .integrate(toi.max(min_toi), &rb.pos.position, local_com);
+
+                let new_pos = vels.integrate(toi.max(min_toi), &rb.pos.position, local_com);
                 rb.pos.next_position = new_pos;
             }
         }
@@ -101,6 +99,18 @@ impl CCDSolver {
                     None
                 };
                 let moving_fast = rb.ccd.is_moving_fast(dt, &rb.integrated_vels, forces);
+
+                rb.ccd.ccd_active = moving_fast;
+                ccd_active = ccd_active || moving_fast;
+            }
+        }
+
+        for handle in islands.active_kinematic_bodies() {
+            let rb = bodies.index_mut_internal(*handle);
+
+            if rb.ccd.ccd_enabled {
+                let moving_fast = rb.ccd.is_moving_fast(dt, &rb.vels, None);
+
                 rb.ccd.ccd_active = moving_fast;
                 ccd_active = ccd_active || moving_fast;
             }
@@ -132,97 +142,130 @@ impl CCDSolver {
 
         for handle in islands.active_dynamic_bodies() {
             let rb1 = &bodies[*handle];
+            self.find_first_impact_rb(
+                dt,
+                bodies,
+                colliders,
+                narrow_phase,
+                rb1,
+                &rb1.integrated_vels,
+                &mut pairs_seen,
+                &mut min_toi,
+            );
+        }
 
-            if rb1.ccd.ccd_active {
-                let predicted_body_pos1 = rb1.pos.integrate_forces_and_velocities(
-                    dt,
-                    &rb1.forces,
-                    &rb1.integrated_vels,
-                    &rb1.mprops,
-                );
-
-                for ch1 in &rb1.colliders.0 {
-                    let co1 = &colliders[*ch1];
-                    let co1_parent = co1
-                        .parent
-                        .as_ref()
-                        .expect("Could not find the ColliderParent component.");
-
-                    if co1.is_sensor() {
-                        continue; // Ignore sensors.
-                    }
-
-                    let predicted_collider_pos1 = predicted_body_pos1 * co1_parent.pos_wrt_parent;
-                    let aabb1 = co1
-                        .shape
-                        .compute_swept_aabb(&co1.pos, &predicted_collider_pos1);
-
-                    self.query_pipeline
-                        .colliders_with_aabb_intersecting_aabb(&aabb1, |ch2| {
-                            if *ch1 == *ch2 {
-                                // Ignore self-intersection.
-                                return true;
-                            }
-
-                            if pairs_seen
-                                .insert(
-                                    SortedPair::new(ch1.into_raw_parts().0, ch2.into_raw_parts().0),
-                                    (),
-                                )
-                                .is_none()
-                            {
-                                let co1 = &colliders[*ch1];
-                                let co2 = &colliders[*ch2];
-
-                                let bh1 = co1.parent.map(|p| p.handle);
-                                let bh2 = co2.parent.map(|p| p.handle);
-
-                                // Ignore self-intersection and sensors and apply collision groups filter.
-                                if bh1 == bh2                                                       // Ignore self-intersection.
-                                    || (co1.is_sensor() || co2.is_sensor())                         // Ignore sensors.
-                                    || !co1.flags.collision_groups.test(co2.flags.collision_groups) // Apply collision groups.
-                                    || !co1.flags.solver_groups.test(co2.flags.solver_groups)
-                                // Apply solver groups.
-                                {
-                                    return true;
-                                }
-
-                                let smallest_dist = narrow_phase
-                                    .contact_pair(*ch1, *ch2)
-                                    .and_then(|p| p.find_deepest_contact())
-                                    .map(|c| c.1.dist)
-                                    .unwrap_or(0.0);
-
-                                let rb2 = bh2.and_then(|h| bodies.get(h));
-
-                                if let Some(toi) = TOIEntry::try_from_colliders(
-                                    self.query_pipeline.query_dispatcher(),
-                                    *ch1,
-                                    *ch2,
-                                    co1,
-                                    co2,
-                                    Some(rb1),
-                                    rb2,
-                                    None,
-                                    None,
-                                    0.0,
-                                    min_toi,
-                                    smallest_dist,
-                                ) {
-                                    min_toi = min_toi.min(toi.toi);
-                                }
-                            }
-
-                            true
-                        });
-                }
-            }
+        for handle in islands.active_kinematic_bodies() {
+            let rb1 = &bodies[*handle];
+            self.find_first_impact_rb(
+                dt,
+                bodies,
+                colliders,
+                narrow_phase,
+                rb1,
+                &rb1.vels,
+                &mut pairs_seen,
+                &mut min_toi,
+            );
         }
 
         if min_toi < dt {
             Some(min_toi)
         } else {
             None
+        }
+    }
+
+    fn find_first_impact_rb(
+        &self,
+        dt: Real,
+        bodies: &RigidBodySet,
+        colliders: &ColliderSet,
+        narrow_phase: &NarrowPhase,
+        rb1: &RigidBody,
+        vel: &RigidBodyVelocity,
+        pairs_seen: &mut HashMap<SortedPair<u32>, ()>,
+        min_toi: &mut Real,
+    ) {
+        if rb1.ccd.ccd_active {
+            let predicted_body_pos1 =
+                rb1.pos
+                    .integrate_forces_and_velocities(dt, &rb1.forces, vel, &rb1.mprops);
+
+            for ch1 in &rb1.colliders.0 {
+                let co1 = &colliders[*ch1];
+                let co1_parent = co1
+                    .parent
+                    .as_ref()
+                    .expect("Could not find the ColliderParent component.");
+
+                if co1.is_sensor() {
+                    continue; // Ignore sensors.
+                }
+
+                let predicted_collider_pos1 = predicted_body_pos1 * co1_parent.pos_wrt_parent;
+                let aabb1 = co1
+                    .shape
+                    .compute_swept_aabb(&co1.pos, &predicted_collider_pos1);
+
+                self.query_pipeline
+                    .colliders_with_aabb_intersecting_aabb(&aabb1, |ch2| {
+                        if *ch1 == *ch2 {
+                            // Ignore self-intersection.
+                            return true;
+                        }
+
+                        if pairs_seen
+                            .insert(
+                                SortedPair::new(ch1.into_raw_parts().0, ch2.into_raw_parts().0),
+                                (),
+                            )
+                            .is_none()
+                        {
+                            let co1 = &colliders[*ch1];
+                            let co2 = &colliders[*ch2];
+
+                            let bh1 = co1.parent.map(|p| p.handle);
+                            let bh2 = co2.parent.map(|p| p.handle);
+
+                            // Ignore self-intersection and sensors and apply collision groups filter.
+                            if bh1 == bh2                                                       // Ignore self-intersection.
+                                || (co1.is_sensor() || co2.is_sensor())                         // Ignore sensors.
+                                || !co1.flags.collision_groups.test(co2.flags.collision_groups) // Apply collision groups.
+                                || !co1.flags.solver_groups.test(co2.flags.solver_groups)
+                            // Apply solver groups.
+                            {
+                                return true;
+                            }
+
+                            let smallest_dist = narrow_phase
+                                .contact_pair(*ch1, *ch2)
+                                .and_then(|p| p.find_deepest_contact())
+                                .map(|c| c.1.dist)
+                                .unwrap_or(0.0);
+
+                            let rb2 = bh2.and_then(|h| bodies.get(h));
+
+                            if let Some(toi) = TOIEntry::try_from_colliders(
+                                self.query_pipeline.query_dispatcher(),
+                                *ch1,
+                                *ch2,
+                                co1,
+                                co2,
+                                Some(rb1),
+                                rb2,
+                                None,
+                                None,
+                                0.0,
+                                *min_toi,
+                                smallest_dist,
+                            ) {
+                                *min_toi = min_toi.min(toi.toi);
+                            }
+                        }
+
+                        true
+                    });
+            }
         }
     }
 
@@ -268,6 +311,7 @@ impl CCDSolver {
         }
 
         for handle in islands.active_kinematic_bodies() {
+            dbg!("Iter kin: {}", handle.into_raw_parts().0);
             let rb1 = &bodies[*handle];
             self.gather_toi_rb(
                 dt,
@@ -288,9 +332,13 @@ impl CCDSolver {
          *
          */
         if min_overstep == dt && all_toi.is_empty() {
+            dbg!("No impacts");
             return PredictedImpacts::NoImpacts;
         } else if min_overstep > dt {
+            dbg!("Impacts after end time");
             return PredictedImpacts::ImpactsAfterEndTime(min_overstep);
+        } else {
+            dbg!("Continuing with TOIs");
         }
 
         // NOTE: all fixed bodies (and kinematic bodies?) should be considered as "frozen", this
@@ -435,8 +483,12 @@ impl CCDSolver {
                 let frozen1 = frozen.get(&b1);
                 let pos1 = frozen1
                     .map(|t| {
-                        rb1.integrated_vels
-                            .integrate(*t, &rb1.pos.position, local_com1)
+                        let vels = if rb1.is_dynamic() {
+                            &rb1.integrated_vels
+                        } else {
+                            &rb1.vels
+                        };
+                        vels.integrate(*t, &rb1.pos.position, local_com1)
                     })
                     .unwrap_or(rb1.pos.next_position);
                 pos1 * co_parent1.pos_wrt_parent
@@ -451,8 +503,12 @@ impl CCDSolver {
                 let frozen2 = frozen.get(&b2);
                 let pos2 = frozen2
                     .map(|t| {
-                        rb2.integrated_vels
-                            .integrate(*t, &rb2.pos.position, local_com2)
+                        let vels = if rb2.is_dynamic() {
+                            &rb2.integrated_vels
+                        } else {
+                            &rb2.vels
+                        };
+                        vels.integrate(*t, &rb2.pos.position, local_com2)
                     })
                     .unwrap_or(rb2.pos.next_position);
                 pos2 * co_parent2.pos_wrt_parent
@@ -493,6 +549,7 @@ impl CCDSolver {
             }
         }
 
+        println!("Found impacts: {}", frozen.len());
         PredictedImpacts::Impacts(frozen)
     }
 
@@ -509,9 +566,15 @@ impl CCDSolver {
         min_overstep: &mut Real,
     ) {
         if rb1.ccd.ccd_active {
+            println!("CCD active");
             let predicted_body_pos1 =
                 rb1.pos
                     .integrate_forces_and_velocities(dt, &rb1.forces, &vels, &rb1.mprops);
+
+            println!(
+                "Pos {} and predicted {}",
+                rb1.pos.position.translation.vector, predicted_body_pos1.translation.vector
+            );
 
             for ch1 in &rb1.colliders.0 {
                 let co1 = &colliders[*ch1];
@@ -539,6 +602,11 @@ impl CCDSolver {
                             )
                             .is_none()
                         {
+                            println!(
+                                "Checking pair {} vs {}",
+                                ch1.into_raw_parts().0,
+                                ch2.into_raw_parts().0
+                            );
                             let co1 = &colliders[*ch1];
                             let co2 = &colliders[*ch2];
 
@@ -557,6 +625,8 @@ impl CCDSolver {
                                 .and_then(|p| p.find_deepest_contact())
                                 .map(|c| c.1.dist)
                                 .unwrap_or(0.0);
+
+                            println!("Smallest dist: {}", smallest_dist);
 
                             let rb1 = bh1.map(|h| &bodies[h]);
                             let rb2 = bh2.map(|h| &bodies[h]);
@@ -578,11 +648,15 @@ impl CCDSolver {
                                 smallest_dist,
                             ) {
                                 if toi.toi > dt {
+                                    println!("TOI a");
                                     *min_overstep = min_overstep.min(toi.toi);
                                 } else {
+                                    println!("TOI b");
                                     *min_overstep = dt;
                                     all_toi.push(toi);
                                 }
+                            } else {
+                                println!("No TOI");
                             }
                         }
 

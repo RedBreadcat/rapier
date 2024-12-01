@@ -53,14 +53,26 @@ impl TOIEntry {
             return None;
         }
 
-        let linvel1 = frozen1.is_none() as u32 as Real
-            * rb1.map(|b| b.integrated_vels.linvel).unwrap_or(na::zero());
-        let linvel2 = frozen2.is_none() as u32 as Real
-            * rb2.map(|b| b.integrated_vels.linvel).unwrap_or(na::zero());
-        let angvel1 = frozen1.is_none() as u32 as Real
-            * rb1.map(|b| b.integrated_vels.angvel).unwrap_or(na::zero());
-        let angvel2 = frozen2.is_none() as u32 as Real
-            * rb2.map(|b| b.integrated_vels.angvel).unwrap_or(na::zero());
+        let vels = |b: &Option<&RigidBody>| {
+            if let Some(b) = b {
+                Some(if b.is_dynamic() {
+                    b.integrated_vels
+                } else {
+                    b.vels
+                })
+            } else {
+                None
+            }
+        };
+
+        let linvel1 =
+            frozen1.is_none() as u32 as Real * vels(&rb1).map(|v| v.linvel).unwrap_or(na::zero());
+        let linvel2 =
+            frozen2.is_none() as u32 as Real * vels(&rb2).map(|v| v.linvel).unwrap_or(na::zero());
+        let angvel1 =
+            frozen1.is_none() as u32 as Real * vels(&rb1).map(|v| v.angvel).unwrap_or(na::zero());
+        let angvel2 =
+            frozen2.is_none() as u32 as Real * vels(&rb2).map(|v| v.angvel).unwrap_or(na::zero());
 
         #[cfg(feature = "dim2")]
         let vel12 = (linvel2 - linvel1).norm()
@@ -81,8 +93,14 @@ impl TOIEntry {
             || !co1.flags.solver_groups.test(co2.flags.solver_groups);
 
         if (end_time - start_time) * vel12 < thickness {
+            println!(
+                "NO toi return end:{}, start:{}, vel12:{}, thickness:{}",
+                end_time, start_time, vel12, thickness
+            );
             return None;
         }
+
+        println!("WE have a toi");
 
         // Compute the TOI.
         let identity = NonlinearRigidMotion::identity();
@@ -151,11 +169,17 @@ impl TOIEntry {
 
     fn body_motion(rb: &RigidBody) -> NonlinearRigidMotion {
         if rb.ccd.ccd_active {
+            let vels = if rb.is_dynamic() {
+                rb.integrated_vels
+            } else {
+                rb.vels
+            };
+
             NonlinearRigidMotion::new(
                 rb.pos.position,
                 rb.mprops.local_mprops.local_com,
-                rb.integrated_vels.linvel,
-                rb.integrated_vels.angvel,
+                vels.linvel,
+                vels.angvel,
             )
         } else {
             NonlinearRigidMotion::constant_position(rb.pos.next_position)
